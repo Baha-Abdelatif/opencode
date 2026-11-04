@@ -28,7 +28,7 @@ restent connectés.
 cd ~/src/opencode
 git fetch upstream 'refs/tags/v2.*:refs/tags/v2.*'
 git rebase --onto vX.Y.Z <ancien-tag> mcp-oauth-fixes   # résoudre, puis git rebase --continue
-git push --force-with-lease origin mcp-oauth-fixes
+git push --no-verify --force-with-lease origin mcp-oauth-fixes   # le contrôle local du monorepo plante sur turbo
 gh workflow run suivre-officiel.yml -R Baha-Abdelatif/opencode
 ```
 

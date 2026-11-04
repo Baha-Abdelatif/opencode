@@ -1,0 +1,234 @@
+# Suit les versions officielles d'OpenCode 2.x et publie un binaire Linux x64 corrigé.
+#
+# À chaque nouvelle version officielle (tag vX.Y.Z publié sur anomalyco/opencode) :
+#   1. rejoue les commits de la branche de correctif (PATCH_BRANCH) sur ce tag ;
+#   2. lance les tests MCP du paquet core ;
+#   3. construit le binaire comme le fait l'officiel (Bun, cible linux-x64, canal latest) ;
+#   4. publie une release « vX.Y.Z-fork » avec l'archive, son empreinte SHA-256 et le correctif appliqué.
+# En cas de conflit ou d'échec, une issue « Fork : échec » est ouverte sur ce dépôt (notification GitHub).
+#
+# Le rejeu se fait dans le runner seulement : la branche de correctif n'est jamais réécrite ici, car le jeton
+# des Actions ne peut pas pousser de commits qui modifient .github/workflows (ceux de l'officiel en modifient).
+# Un conflit se règle à la main : rebaser PATCH_BRANCH sur le nouveau tag, pousser, relancer ce workflow.
+name: Suivre l'officiel et publier le binaire corrigé
+
+on:
+  schedule:
+    - cron: "23 */3 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag officiel à construire, par exemple v2.2.5 (vide : dernière version 2.x publiée)"
+        required: false
+        default: ""
+      force:
+        description: "Reconstruire même si la release existe déjà"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: suivre-officiel
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: anomalyco/opencode
+  PATCH_BRANCH: mcp-oauth-fixes
+  ISSUE_TITLE: "Fork : échec du suivi de l'officiel"
+
+jobs:
+  suivre:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Choisir la version officielle
+        id: plan
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG:-}"
+          if [ -z "$tag" ]; then
+            tag=$(gh release list -R "$UPSTREAM" --exclude-drafts --exclude-pre-releases --limit 60 \
+              --json tagName -q '.[].tagName' | grep -E '^v2\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)
+          fi
+          if ! printf '%s' "$tag" | grep -Eq '^v2\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Tag officiel invalide ou introuvable : '$tag'"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "fork_tag=${tag}-fork" >> "$GITHUB_OUTPUT"
+          if gh release view "${tag}-fork" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 && [ "${INPUT_FORCE:-false}" != "true" ]; then
+            echo "Release ${tag}-fork déjà publiée : rien à faire."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Récupérer la branche de correctif
+        if: steps.plan.outputs.skip == 'false'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.PATCH_BRANCH }}
+          fetch-depth: 0
+          filter: blob:none
+          path: src
+
+      - name: Rejouer le correctif sur la version officielle
+        if: steps.plan.outputs.skip == 'false'
+        id: rebase
+        working-directory: src
+        env:
+          TAG: ${{ steps.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/$UPSTREAM.git"
+          git fetch --filter=blob:none --no-tags upstream 'refs/tags/v2.*:refs/tags/v2.*'
+          patch_sha=$(git rev-parse HEAD)
+          base=$(git tag --merged HEAD --list 'v2.*' | sort -V | tail -1)
+          [ -n "$base" ] || { echo "::error::Aucun tag officiel 2.x sous $PATCH_BRANCH"; exit 1; }
+          echo "patch_sha=$patch_sha" >> "$GITHUB_OUTPUT"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "Correctif : $(git rev-list --count "$base"..HEAD) commit(s) sur $base, rejoués sur $TAG"
+          if ! git rebase --empty=drop --onto "$TAG" "$base" HEAD; then
+            git diff --name-only --diff-filter=U | sed 's/^/- `/; s/$/`/' > ../conflits.txt || true
+            git rebase --abort || true
+            echo "::error::Conflit en rejouant $PATCH_BRANCH ($base) sur $TAG"
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          git log --format='- %s (%an)' "$TAG"..HEAD > ../commits.txt
+          git format-patch --stdout "$TAG"..HEAD > ../correctif.patch
+          echo "head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Lire la version de Bun exigée par l'officiel
+        if: steps.plan.outputs.skip == 'false'
+        id: bun
+        working-directory: src
+        run: |
+          version=$(node -p "require('./package.json').packageManager.split('@')[1]")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "BUN_VERSION_REQUISE=$version" >> "$GITHUB_ENV"
+
+      - name: Installer Bun
+        if: steps.plan.outputs.skip == 'false'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ steps.bun.outputs.version }}
+
+      - name: Installer les dépendances
+        if: steps.plan.outputs.skip == 'false'
+        working-directory: src
+        run: bun install --frozen-lockfile
+
+      - name: Tester le MCP et l'OAuth
+        if: steps.plan.outputs.skip == 'false'
+        working-directory: src/packages/core
+        run: bun test test/mcp-oauth.test.ts test/mcp.test.ts
+
+      - name: Construire le binaire Linux x64
+        if: steps.plan.outputs.skip == 'false'
+        working-directory: src/packages/cli
+        env:
+          OPENCODE_VERSION: ${{ steps.plan.outputs.version }}+fork
+          OPENCODE_CHANNEL: latest
+          OPENCODE_TARGET: linux-x64
+        run: |
+          set -euo pipefail
+          BUN_COMPILE_RELEASE="bun-v$BUN_VERSION_REQUISE" bun run build
+          bin=dist/cli-linux-x64/bin/opencode
+          got=$("$bin" --version)
+          echo "Version du binaire : $got"
+          [ "$got" = "opencode v$OPENCODE_VERSION" ] || { echo "::error::Version inattendue : $got"; exit 1; }
+          mkdir -p "$GITHUB_WORKSPACE/publication"
+          tar -czf "$GITHUB_WORKSPACE/publication/opencode-linux-x64.tar.gz" -C dist/cli-linux-x64/bin opencode
+          cp "$GITHUB_WORKSPACE/correctif.patch" "$GITHUB_WORKSPACE/publication/correctif.patch"
+          (cd "$GITHUB_WORKSPACE/publication" && sha256sum opencode-linux-x64.tar.gz correctif.patch > SHA256SUMS)
+
+      - name: Publier la release
+        if: steps.plan.outputs.skip == 'false'
+        env:
+          TAG: ${{ steps.plan.outputs.tag }}
+          FORK_TAG: ${{ steps.plan.outputs.fork_tag }}
+          BASE: ${{ steps.rebase.outputs.base }}
+          PATCH_SHA: ${{ steps.rebase.outputs.patch_sha }}
+          HEAD_SHA: ${{ steps.rebase.outputs.head }}
+        run: |
+          set -euo pipefail
+          {
+            echo "Binaire OpenCode officiel $TAG avec le correctif MCP OAuth du fork."
+            echo
+            echo "- Officiel : https://github.com/$UPSTREAM/releases/tag/$TAG"
+            echo "- Correctif : branche \`$PATCH_BRANCH\` @ \`$PATCH_SHA\` (écrite sur $BASE), rejouée sur $TAG"
+            echo "- Commit construit (non poussé) : \`$HEAD_SHA\`, détail dans \`correctif.patch\`"
+            echo
+            echo "Commits appliqués :"
+            cat commits.txt
+          } > notes.md
+          gh release delete "$FORK_TAG" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$FORK_TAG" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --latest \
+            --title "$FORK_TAG" --notes-file notes.md \
+            publication/opencode-linux-x64.tar.gz publication/correctif.patch publication/SHA256SUMS
+
+      - name: Noter la dernière version construite
+        if: steps.plan.outputs.skip == 'false'
+        env:
+          FORK_TAG: ${{ steps.plan.outputs.fork_tag }}
+          PATCH_SHA: ${{ steps.rebase.outputs.patch_sha }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${GITHUB_REF_NAME}" "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" etat-depot
+          cd etat-depot
+          printf '%s\n' "$FORK_TAG $PATCH_SHA $(date -u +%Y-%m-%dT%H:%MZ)" > etat/derniere-version.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add etat/derniere-version.txt
+          git commit -q -m "etat: $FORK_TAG publié" && git push -q origin "HEAD:${GITHUB_REF_NAME}" || echo "État inchangé."
+
+      - name: Fermer l'alerte précédente
+        if: steps.plan.outputs.skip == 'false'
+        env:
+          FORK_TAG: ${{ steps.plan.outputs.fork_tag }}
+        run: |
+          for n in $(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "\"$ISSUE_TITLE\" in:title" --json number -q '.[].number'); do
+            gh issue close "$n" -R "$GITHUB_REPOSITORY" --comment "Résolu : $FORK_TAG publié."
+          done
+
+      - name: Alerter en cas d'échec
+        if: failure()
+        env:
+          TAG: ${{ steps.plan.outputs.tag }}
+          CONFLICT: ${{ steps.rebase.outputs.conflict }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          {
+            if [ "$CONFLICT" = "true" ]; then
+              echo "Le correctif \`$PATCH_BRANCH\` ne s'applique plus proprement sur l'officiel ${TAG:-?}."
+              echo
+              echo "Fichiers en conflit :"
+              cat conflits.txt 2>/dev/null || echo "- (liste indisponible)"
+              echo
+              echo "À faire : rebaser \`$PATCH_BRANCH\` sur ${TAG:-le nouveau tag} en local, pousser, relancer le workflow."
+            else
+              echo "Le suivi de l'officiel ${TAG:-?} a échoué (tests, build ou publication)."
+            fi
+            echo
+            echo "Journal : $RUN_URL"
+            echo
+            echo "Le binaire installé sur les postes n'a pas changé."
+          } > alerte.md
+          existing=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "\"$ISSUE_TITLE\" in:title" --json number -q '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" -R "$GITHUB_REPOSITORY" --body-file alerte.md
+          else
+            gh issue create -R "$GITHUB_REPOSITORY" --title "$ISSUE_TITLE" --body-file alerte.md --assignee "$GITHUB_REPOSITORY_OWNER"
+          fi

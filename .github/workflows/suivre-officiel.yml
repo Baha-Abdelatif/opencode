@@ -206,7 +206,7 @@ jobs:
       - name: Alerter en cas d'échec
         if: failure()
         env:
-          TAG: ${{ steps.plan.outputs.tag }}
+          TAG: ${{ steps.plan.outputs.tag || inputs.tag || '(dernière 2.x)' }}
           CONFLICT: ${{ steps.rebase.outputs.conflict }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
@@ -219,7 +219,7 @@ jobs:
               echo
               echo "À faire : rebaser \`$PATCH_BRANCH\` sur ${TAG:-le nouveau tag} en local, pousser, relancer le workflow."
             else
-              echo "Le suivi de l'officiel ${TAG:-?} a échoué (tests, build ou publication)."
+              echo "Le suivi de l'officiel ${TAG:-?} a échoué (choix de version, tests, build ou publication)."
             fi
             echo
             echo "Journal : $RUN_URL"

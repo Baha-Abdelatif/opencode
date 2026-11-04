@@ -74,7 +74,7 @@ jobs:
 
       - name: Récupérer la branche de correctif
         if: steps.plan.outputs.skip == 'false'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ env.PATCH_BRANCH }}
           fetch-depth: 0

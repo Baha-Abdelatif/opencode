@@ -506,6 +506,21 @@ describe("MCP OAuth", () => {
     expect(url.searchParams.has("prompt")).toBe(false)
   })
 
+  test("asks Google for offline access and consent so it issues a refresh token", async () => {
+    const { server } = authorizationServer({ authorization_endpoint: "https://accounts.google.com/o/oauth2/v2/auth" })
+    const { url } = await Effect.runPromise(Effect.scoped(start(server))).finally(() => server.stop(true))
+    expect(url.hostname).toBe("accounts.google.com")
+    expect(url.searchParams.get("access_type")).toBe("offline")
+    expect(url.searchParams.get("prompt")).toBe("consent")
+  })
+
+  test("leaves other authorization servers without Google-specific parameters", async () => {
+    const { server } = authorizationServer({})
+    const { url } = await Effect.runPromise(Effect.scoped(start(server))).finally(() => server.stop(true))
+    expect(url.searchParams.has("access_type")).toBe(false)
+    expect(url.searchParams.has("prompt")).toBe(false)
+  })
+
   test("forwards iss from the redirect so issuer-advertising servers can complete", async () => {
     const { server } = authorizationServer({ authorization_response_iss_parameter_supported: true })
     const result = await Effect.runPromise(

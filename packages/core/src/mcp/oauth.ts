@@ -247,6 +247,12 @@ const provider = (options: Options): OAuthClientProvider => {
         throw new Error(
           `MCP server "${options.config.url}" returned a ${url.protocol} authorization URL; only http and https are supported`,
         )
+      // Google issues a refresh token only for access_type=offline, and again after the first consent
+      // only with prompt=consent; without one the login expires after an hour (anomalyco/opencode#59820).
+      if (url.hostname === "accounts.google.com") {
+        if (!url.searchParams.has("access_type")) url.searchParams.set("access_type", "offline")
+        if (!url.searchParams.has("prompt")) url.searchParams.set("prompt", "consent")
+      }
       return redirect.open(url)
     },
     ...(options.invalidate ? { invalidateCredentials: options.invalidate } : {}),

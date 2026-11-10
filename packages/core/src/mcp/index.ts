@@ -832,7 +832,42 @@ export const layer = (options?: Options) =>
               tool: input.name,
               message: unavailable(server, target.entry.status),
             })
-          return yield* target.entry.connection.recovering(target.client, call).pipe(failed("server"))
+          // Capture the connection the call actually ran on. recovering() may replace the live client
+          // after a session expiry, so a late 401 from the old connection must not tear down the newer one.
+          let ranOn: McpClient.Connection | undefined
+          return yield* target.entry.connection
+            .recovering(target.client, (connection) => {
+              ranOn = connection
+              return call(connection)
+            })
+            .pipe(
+              // A precisely detected auth failure (real HTTP 401 / SDK UnauthorizedError surfaced as
+              // NeedsAuthError): stop the server and mark it needs_auth, so the user is offered a login
+              // instead of every call failing silently. Matched by tag: the client module loads lazily.
+              Effect.catchIf(
+                (error) => "_tag" in error && error._tag === "MCP.NeedsAuthError",
+                (error) =>
+                  Effect.gen(function* () {
+                    // Serialized with other lifecycle work, and only when the server is still live on the
+                    // exact connection the call ran on, so a newer status is never overwritten.
+                    yield* Effect.gen(function* () {
+                      if (!ranOn || target.entry.connection.client !== ranOn) return
+                      yield* target.entry.connection.stop
+                      target.entry.status = { status: "needs_auth", error: error.message }
+                      yield* bus.publish(McpEvent.StatusChanged, { server })
+                    }).pipe(locks.withLock(server))
+                    return yield* new ToolCallError({
+                      server,
+                      tool: input.name,
+                      message: `MCP tool "${input.name}" on server "${server}" requires authentication: ${error.message}`,
+                    })
+                  }),
+              ),
+              Effect.catchIf(
+                (error): error is Exclude<typeof error, ToolCallError> => !(error instanceof ToolCallError),
+                (error) => Effect.fail(error).pipe(failed("server")),
+              ),
+            )
         }),
         instructions: Effect.fn("MCP.instructions")(function* () {
           return Array.from(entries)
